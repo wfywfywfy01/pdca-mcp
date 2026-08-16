@@ -27,29 +27,56 @@ def _rows(sql: str, params: tuple = ()) -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
+def _store_ids_for_owner(owner_key: str) -> list[str]:
+    """返回某 owner_key 名下的活跃门店 store_id（sales 角色范围）。"""
+    if not owner_key:
+        return []
+    rows = _rows(
+        "select store_id from dealer_stores where is_active = true and sales_owner = %s",
+        (owner_key,),
+    )
+    return [r["store_id"] for r in rows]
+
+
 # ── 门店 ───────────────────────────────────────────────────────────────────────
 
-def list_stores(region: str = "") -> list[dict]:
+def list_stores(region: str = "", owner_key: str = "") -> list[dict]:
     sql = (
         "select store_id, name, region, country, dealer_level, sales_owner, team_key "
         "from dealer_stores where is_active = true"
     )
-    params: tuple = ()
+    params: list = []
+    if owner_key:
+        sql += " and sales_owner = %s"
+        params.append(owner_key)
     if region:
         sql += " and region = %s"
-        params = (region,)
+        params.append(region)
     sql += " order by region, sort_order, store_id"
-    return _rows(sql, params)
+    return _rows(sql, tuple(params))
 
 
 # ── Sell-in（经销商进货，CNY 万）──────────────────────────────────────────────
 
-def sell_in_summary(month: str) -> dict:
-    rows = _rows(
+def sell_in_summary(month: str, owner_key: str = "") -> dict:
+    params: list = [month + "%"]
+    sql = (
         "select check_date, dealer_name, sell_in_wan, units, phone_qty "
-        "from dealer_sales where check_date like %s order by check_date desc",
-        (month + "%",),
+        "from dealer_sales where check_date like %s"
     )
+    if owner_key:
+        # dealer_sales 的客户名已脱敏，按该 owner 名下的门店名过滤（能匹配多少算多少）
+        store_names = _rows(
+            "select name from dealer_stores where is_active = true and sales_owner = %s",
+            (owner_key,),
+        )
+        names = [r["name"] for r in store_names]
+        if not names:
+            return {"month": month, "record_count": 0, "total_wan": 0.0, "dealers": []}
+        sql += " and dealer_name = any(%s)"
+        params.append(names)
+    sql += " order by check_date desc"
+    rows = _rows(sql, tuple(params))
     total_wan = round(sum(float(r["sell_in_wan"] or 0) for r in rows), 2)
     return {
         "month": month,
@@ -65,12 +92,20 @@ def sell_in_summary(month: str) -> dict:
 SELL_OUT_REVIEW_THRESHOLD_USD = 1_000_000
 
 
-def sell_out_summary(month: str) -> dict:
-    rows = _rows(
+def sell_out_summary(month: str, owner_key: str = "") -> dict:
+    params: list = [month + "%"]
+    sql = (
         "select report_date, dealer_id, dealer_name, deal_count, deal_amount_yuan "
-        "from walkin_daily_reports where report_date like %s order by report_date desc",
-        (month + "%",),
+        "from walkin_daily_reports where report_date like %s"
     )
+    if owner_key:
+        store_ids = _store_ids_for_owner(owner_key)
+        if not store_ids:
+            return {"month": month, "record_count": 0, "total_usd": 0.0, "excluded_record_count": 0, "stores": []}
+        sql += " and dealer_id = any(%s)"
+        params.append(store_ids)
+    sql += " order by report_date desc"
+    rows = _rows(sql, tuple(params))
     valid = [r for r in rows if float(r["deal_amount_yuan"] or 0) <= SELL_OUT_REVIEW_THRESHOLD_USD]
     total_usd = round(sum(float(r["deal_amount_yuan"] or 0) for r in valid), 2)
     excluded = len(rows) - len(valid)
@@ -85,7 +120,7 @@ def sell_out_summary(month: str) -> dict:
 
 # ── 五件套明细（客流来源 + 成交漏斗）────────────────────────────────────────
 
-def five_kit(month: str, dealer_id: str = "") -> list[dict]:
+def five_kit(month: str, dealer_id: str = "", owner_key: str = "") -> list[dict]:
     sql = (
         "select report_date, dealer_id, dealer_name, walkin_visits, cross_visits, "
         "online_visits, recruit_visits, existing_visits, touch_count, use_count, "
@@ -96,6 +131,12 @@ def five_kit(month: str, dealer_id: str = "") -> list[dict]:
     if dealer_id:
         sql += " and dealer_id = %s"
         params.append(dealer_id)
+    elif owner_key:
+        store_ids = _store_ids_for_owner(owner_key)
+        if not store_ids:
+            return []
+        sql += " and dealer_id = any(%s)"
+        params.append(store_ids)
     sql += " order by report_date desc"
     return _rows(sql, tuple(params))
 
