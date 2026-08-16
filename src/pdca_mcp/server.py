@@ -165,9 +165,10 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.transport == "http":
-        mcp.settings.host = args.host
-        mcp.settings.port = args.port
-        mcp.run(transport="streamable-http")
+        import uvicorn
+
+        # build_http_app() 已包含 API key 认证 + lifespan 转发
+        uvicorn.run(build_http_app(), host=args.host, port=args.port)
     else:
         mcp.run()
 
