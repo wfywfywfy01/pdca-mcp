@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import datetime, timezone
+import math
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -25,6 +27,35 @@ def _rows(sql: str, params: tuple = ()) -> list[dict]:
     with _cursor() as cur:
         cur.execute(sql, params)
         return [dict(r) for r in cur.fetchall()]
+
+
+def _utc_iso(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _finite_amount(value) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        amount = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return amount if math.isfinite(amount) else None
+
+
+def _latest_reports(rows: list[dict]) -> list[dict]:
+    """Keep one current version per store/day without changing stored history."""
+    latest = {}
+    for row in rows:
+        key = (row["dealer_id"], row["report_date"])
+        version = (_utc_iso(row.get("created_at")) or "", row.get("id") or 0)
+        if key not in latest or version > latest[key][0]:
+            latest[key] = (version, row)
+    return [row for _, row in latest.values()]
 
 
 def _store_ids_for_owner(owner_key: str) -> list[str]:
@@ -61,7 +92,7 @@ def list_stores(region: str = "", owner_key: str = "") -> list[dict]:
 def sell_in_summary(month: str, owner_key: str = "") -> dict:
     params: list = [month + "%"]
     sql = (
-        "select check_date, dealer_name, sell_in_wan, units, phone_qty "
+        "select check_date, dealer_name, sell_in_wan, units, phone_qty, source_file, synced_at "
         "from dealer_sales where check_date like %s"
     )
     if owner_key:
@@ -71,18 +102,35 @@ def sell_in_summary(month: str, owner_key: str = "") -> dict:
             (owner_key,),
         )
         names = [r["name"] for r in store_names]
-        if not names:
-            return {"month": month, "record_count": 0, "total_wan": 0.0, "dealers": []}
         sql += " and dealer_name = any(%s)"
         params.append(names)
     sql += " order by check_date desc"
     rows = _rows(sql, tuple(params))
-    total_wan = round(sum(float(r["sell_in_wan"] or 0) for r in rows), 2)
+    snapshot_date = max((row["check_date"] for row in rows), default=None)
+    rows = [row for row in rows if row["check_date"] == snapshot_date]
+    amounts = [_finite_amount(row["sell_in_wan"]) for row in rows]
+    amount_state = "available" if rows else "missing"
+    legacy_sources = {"vertu-cli:sales-orders", "sync_from_vertu"}
+    if rows and (None in amounts or (
+            all(amount == 0 for amount in amounts)
+            and any(row["units"] != 0 for row in rows)
+            and any(row.get("source_file") in legacy_sources for row in rows))):
+        amount_state = "suspect"
+    total_wan = round(sum(amounts), 2) if amount_state == "available" else None
+    dealers = [dict(row, sell_in_wan=amount if amount_state == "available" else None,
+                    synced_at=_utc_iso(row.get("synced_at")), amount_state=amount_state)
+               for row, amount in zip(rows, amounts)]
     return {
         "month": month,
         "record_count": len(rows),
         "total_wan": total_wan,
-        "dealers": rows,
+        "dealers": dealers,
+        "has_data": bool(rows),
+        "snapshot_date": snapshot_date,
+        "source": "dealer_sales_db_latest_snapshot",
+        "as_of": max((row["synced_at"] for row in dealers if row["synced_at"]), default=None),
+        "amount_state": amount_state,
+        "amount_message": "快照金额缺失、无效，或旧来源存在销量但金额全零；金额待复核，销量和原始数据保留。" if amount_state == "suspect" else "",
     }
 
 
@@ -93,28 +141,22 @@ SELL_OUT_REVIEW_THRESHOLD_USD = 1_000_000
 
 
 def sell_out_summary(month: str, owner_key: str = "") -> dict:
-    params: list = [month + "%"]
-    sql = (
-        "select report_date, dealer_id, dealer_name, deal_count, deal_amount_yuan "
-        "from walkin_daily_reports where report_date like %s"
-    )
-    if owner_key:
-        store_ids = _store_ids_for_owner(owner_key)
-        if not store_ids:
-            return {"month": month, "record_count": 0, "total_usd": 0.0, "excluded_record_count": 0, "stores": []}
-        sql += " and dealer_id = any(%s)"
-        params.append(store_ids)
-    sql += " order by report_date desc"
-    rows = _rows(sql, tuple(params))
-    valid = [r for r in rows if float(r["deal_amount_yuan"] or 0) <= SELL_OUT_REVIEW_THRESHOLD_USD]
-    total_usd = round(sum(float(r["deal_amount_yuan"] or 0) for r in valid), 2)
+    rows = five_kit(month, owner_key=owner_key)
+    valid = [row for row in rows if not row["amount_requires_review"]]
+    total_usd = round(sum(row["deal_amount_usd"] for row in valid), 2) if valid else None
     excluded = len(rows) - len(valid)
+    amount_state = "missing" if not rows else "suspect" if not valid else "partial" if excluded else "available"
     return {
         "month": month,
         "record_count": len(rows),
         "total_usd": total_usd,
         "excluded_record_count": excluded,
         "stores": rows,
+        "has_data": bool(rows),
+        "amount_state": amount_state,
+        "source": "walkin_daily_reports_db_latest_submission",
+        "as_of": max((row["created_at"] for row in rows if row["created_at"]), default=None),
+        "amount_message": f"{excluded} 条金额待复核，未计入汇总。" if excluded else "",
     }
 
 
@@ -122,7 +164,7 @@ def sell_out_summary(month: str, owner_key: str = "") -> dict:
 
 def five_kit(month: str, dealer_id: str = "", owner_key: str = "") -> list[dict]:
     sql = (
-        "select report_date, dealer_id, dealer_name, walkin_visits, cross_visits, "
+        "select id, created_at, report_date, dealer_id, dealer_name, walkin_visits, cross_visits, "
         "online_visits, recruit_visits, existing_visits, touch_count, use_count, "
         "wechat_add_count, deal_count, deal_amount_yuan, notes, submitted_by "
         "from walkin_daily_reports where report_date like %s"
@@ -131,14 +173,22 @@ def five_kit(month: str, dealer_id: str = "", owner_key: str = "") -> list[dict]
     if dealer_id:
         sql += " and dealer_id = %s"
         params.append(dealer_id)
-    elif owner_key:
+    if owner_key:
         store_ids = _store_ids_for_owner(owner_key)
-        if not store_ids:
+        if not store_ids or (dealer_id and dealer_id not in store_ids):
             return []
         sql += " and dealer_id = any(%s)"
         params.append(store_ids)
     sql += " order by report_date desc"
-    return _rows(sql, tuple(params))
+    rows = _latest_reports(_rows(sql, tuple(params)))
+    result = []
+    for row in rows:
+        amount = _finite_amount(row["deal_amount_yuan"])
+        requires_review = amount is None or not 0 <= amount <= SELL_OUT_REVIEW_THRESHOLD_USD
+        result.append(dict(row, created_at=_utc_iso(row.get("created_at")),
+                           deal_amount_usd=None if requires_review else amount,
+                           amount_requires_review=requires_review))
+    return result
 
 
 # ── 会议 ───────────────────────────────────────────────────────────────────────

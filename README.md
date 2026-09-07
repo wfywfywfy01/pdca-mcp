@@ -67,4 +67,30 @@ http://<host>:8765/mcp
 - **stdio（本地）**：靠本机信任，`.env` 里的数据库连接即凭证。
 - **HTTP（远程）**：`PDCA_MCP_API_KEYS` 里配置的 key 作为 Bearer token（多个 key 逗号分隔，分发给不同使用者）。
 
+HTTP 的每次请求都必须携带 `Authorization: Bearer ...`，包括已有会话的
+工具调用、列表和会话关闭；`Mcp-Session-Id` 不是身份凭据。会话内切换
+有效 key 时，数据范围按当次请求的 key 重新计算，不继承原 key 的权限。
+未知 key、未知角色以及没有 `owner_key` 的 sales/dealer key 均拒绝访问。
+admin/viewer 可以查询全局数据；会议、月度目标暂未实现逐人过滤，因此
+HTTP 下只允许 admin/viewer。建议显式配置 `key:role:owner_key`；旧的
+单 key 配置仍按原契约视为 admin，不应分发给受限用户。
+
 > 当前第一版为只读查询，连接建议用只读数据库账号，不要用 postgres 超级用户。
+
+## 安全回归与发布
+
+设置 `PYTHONPATH=src` 后运行 `python -m unittest discover -s tests -p "test_*.py"`。
+这组测试只使用模拟身份、模拟数据和本地 MCP 协议，不连接数据库。
+旧的 `e2e_*.py` 是显式测试环境检查，必须自行提供
+`PDCA_MCP_TEST_DATABASE_URL`；远程检查另外需要 `PDCA_MCP_TEST_URL`、
+`PDCA_MCP_TEST_ADMIN_KEY`、`PDCA_MCP_TEST_SALES_KEY`。不得配置生产数据库
+或把凭据写入代码。删除当前文件的明文不能消除 Git 历史泄露，已暴露的
+凭据仍需由所有者授权轮换。
+
+镜像使用固定运行时摘要；发布时从已合并的明确 commit 构建，并传入
+`--build-arg SOURCE_REVISION=<commit>`，镜像标签也使用该 commit。
+通过 `org.opencontainers.image.revision` 标签核验版本，不发布 `latest`。
+当前生产额外使用 `/app/data/start_mcp.py` 的域名防护配置及
+`health_sidecar.py`，它们不在此仓库中。替换容器必须保留现有命令、挂载、
+网络、端口和健康检查配置，只换镜像；旧容器先停止、改名保留回滚，
+不得直接用 Dockerfile 默认命令覆盖现役启动包装脚本。
