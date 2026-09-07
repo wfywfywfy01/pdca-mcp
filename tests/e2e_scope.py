@@ -1,12 +1,14 @@
 import asyncio
+import json
 import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
-os.environ["PDCA_MCP_DATABASE_URL"] = "postgresql://postgres:H1UaJoeo-aSF-zpM6V-0ARP@10.100.0.176:5432/pdca"
+os.environ["PDCA_MCP_DATABASE_URL"] = os.environ["PDCA_MCP_TEST_DATABASE_URL"]
 os.environ["PDCA_MCP_API_KEYS"] = "admin-key:admin:,april-key:sales:April"
-os.environ["PYTHONPATH"] = r"D:\pdca-mcp\src" + os.pathsep + os.environ.get("PYTHONPATH", "")
+os.environ["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src") + os.pathsep + os.environ.get("PYTHONPATH", "")
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
@@ -22,7 +24,7 @@ async def call(key, tool, args):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 r = await session.call_tool(tool, args)
-                return eval(r.content[0].text)
+                return json.loads(r.content[0].text)
     except BaseException as e:
         return f"EXC {type(e).__name__}"
 
@@ -38,9 +40,9 @@ async def main():
     april_stores = await call("april-key", "query_stores", {"region": ""})
     april_sell_out = await call("april-key", "query_sell_out", {"month": "2026-08"})
 
-    print("admin key 门店数:", len(admin_stores) if isinstance(admin_stores, list) else admin_stores)
-    print("April key 门店数:", len(april_stores) if isinstance(april_stores, list) else april_stores)
-    print("April 门店 sales_owner 集合:", sorted({s["sales_owner"] for s in april_stores}) if isinstance(april_stores, list) else "-")
+    print("admin key 门店数:", admin_stores.get("count") if isinstance(admin_stores, dict) else "ERROR")
+    print("sales key 门店数:", april_stores.get("count") if isinstance(april_stores, dict) else "ERROR")
+    print("sales Sell-out 请求成功:", isinstance(april_sell_out, dict))
 
     proc.terminate()
 

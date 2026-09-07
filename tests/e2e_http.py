@@ -1,12 +1,14 @@
 import asyncio
+import json
 import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
-os.environ["PDCA_MCP_DATABASE_URL"] = "postgresql://postgres:H1UaJoeo-aSF-zpM6V-0ARP@10.100.0.176:5432/pdca"
+os.environ["PDCA_MCP_DATABASE_URL"] = os.environ["PDCA_MCP_TEST_DATABASE_URL"]
 os.environ["PDCA_MCP_API_KEYS"] = "test-key-123"
-os.environ["PYTHONPATH"] = r"D:\pdca-mcp\src" + os.pathsep + os.environ.get("PYTHONPATH", "")
+os.environ["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src") + os.pathsep + os.environ.get("PYTHONPATH", "")
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
@@ -34,9 +36,8 @@ async def main():
         proc.terminate()
 
     if result and not str(result).startswith("EXC"):
-        stores = eval(result)
-        print("HTTP_OK 中东门店数:", len(stores))
-        print("样例:", stores[0]["name"] if stores else "无")
+        payload = json.loads(result)
+        print("HTTP_OK 中东门店数:", payload.get("count"))
     else:
         print("HTTP 结果:", str(result)[:300])
 

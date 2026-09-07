@@ -1,6 +1,9 @@
-# 基于服务器已有的 MCP 运行时镜像（含 mcp / psycopg2 / uvicorn 依赖），
-# 只覆盖业务代码，避免在受限网络上重新 pip install。
-FROM pdca-mcp:sse-fix
+# 使用已核验的服务器运行时摘要，不跟随可变标签升级依赖。
+ARG MCP_RUNTIME_IMAGE=pdca-mcp@sha256:6a906dbfbaf2b1cb35a7482fc84cec40274aee2587319849397b8269e66b5531
+FROM ${MCP_RUNTIME_IMAGE}
+ARG SOURCE_REVISION=unknown
+LABEL org.opencontainers.image.revision=$SOURCE_REVISION \
+      org.opencontainers.image.source="https://github.com/wfywfywfy01/pdca-mcp"
 
 WORKDIR /app
 
